@@ -21,6 +21,14 @@ from ._common import call, clamp
 
 _ADDRESS = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _QUOTED = re.compile(r"^\s*>")
+#: Lines that mean "this paragraph is a digest or a quoted header", never a signature.
+_HEADERISH = re.compile(
+    r"^\s*(\[\s*(inbox|sent|drafts?|trash|junk)\b"
+    r"|(from|to|cc|bcc|subject|subj|date|sent|reply-to)\s*:"
+    r"|#\s*\d+\s*$"
+    r"|-{2,}\s*(original message|forwarded message|元のメッセージ)\s*-{2,})",
+    re.IGNORECASE,
+)
 
 
 async def _tolerant(method: str, variants: list[dict[str, Any]], timeout: float = 45.0) -> Any:
@@ -288,13 +296,157 @@ def register(reg: Registrar) -> None:
                     if key:
                         blocks[key] = blocks.get(key, 0) + 1
 
-        ranked = sorted(blocks.items(), key=lambda kv: (-kv[1], -len(kv[0])))
+        identity = await _default_identity()
+        address = str((identity or {}).get("email") or "")
+        tokens = {
+            token
+            for token in re.split(r"[\s\u3000,;/]+", str((identity or {}).get("name") or ""))
+            if len(token) >= 2
+        }
+
+        scored = [
+            (_signature_score(text, n, tokens, address), n, text) for text, n in blocks.items()
+        ]
+        scored.sort(key=lambda row: (-row[0], -row[1], -len(row[2])))
+        kept = [row for row in scored if row[1] >= 2 or row[0] > 10]
+        if not kept and scored:
+            kept = scored[:1]
+
         return {
             "folders": [f.get("name") for f in sent[:2]],
             "sampled": sampled,
-            "candidates": [{"count": n, "lines": text.splitlines()} for text, n in ranked[:3]],
+            "candidates": [
+                {"score": score, "count": n, "lines": text.splitlines()} for score, n, text in kept[:3]
+            ],
+            "dropped": max(0, len(scored) - len(kept)),
             "note": "Candidates are evidence, not a template. Confirm before reusing.",
         }
+
+    @reg.read_tool(title="Find conversations still waiting on someone")
+    async def mail_unreplied(
+        direction: str = "inbound",
+        lookback_days: int = 30,
+        waiting_days: int = 3,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """List conversations where a reply is still owed — by either side.
+
+        `direction="inbound"` finds mail addressed to you whose thread nobody has
+        answered from your account. `"outbound"` finds your own mail that drew no
+        human reply (Thunderbird's index does that work). `"both"` returns each.
+        A candidate is evidence, not an instruction: read it before replying.
+        """
+        look = clamp(lookback_days, default=30, minimum=1, maximum=180, field="lookback_days")
+        wait = clamp(waiting_days, default=3, minimum=1, maximum=look, field="waiting_days")
+        size = clamp(limit, default=20, minimum=1, maximum=50, field="limit")
+        if direction not in ("inbound", "outbound", "both"):
+            raise UsageError('direction must be "inbound", "outbound", or "both".')
+
+        result: dict[str, Any] = {"lookback_days": look, "waiting_days": wait}
+
+        if direction in ("outbound", "both"):
+            try:
+                result["outbound"] = await call(
+                    "messages.followups",
+                    {"lookbackDays": look, "waitingDays": wait, "limit": size},
+                    timeout=90.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - index missing is a coverage note, not a failure
+                result["outbound"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        if direction in ("inbound", "both"):
+            identity = await _default_identity()
+            me = str((identity or {}).get("email") or own_lower()).lower()
+            if not me:
+                raise UsageError("Could not tell which address is yours; inbound needs an identity.")
+            now = _dt.datetime.now(_dt.UTC)
+            cutoff = now - _dt.timedelta(days=look)
+            wait_before = now - _dt.timedelta(days=wait)
+
+            candidates: list[dict[str, Any]] = []
+            examined = unknown = 0
+            inboxes = [f for f in await _folders() if _has_use(f, "inbox")]
+            for folder in inboxes:
+                if len(candidates) >= size or examined >= size * 3:
+                    break
+                try:
+                    listed = _items(
+                        await _tolerant(
+                            "messages.list",
+                            [
+                                {"folderId": folder["id"], "limit": 200},
+                                {"folder_id": folder["id"], "limit": 200},
+                            ],
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                for message in listed:
+                    if len(candidates) >= size or examined >= size * 3:
+                        break
+                    author = str(message.get("author") or "").lower()
+                    if me in author:
+                        continue
+                    when = _parse_date(message.get("date"))
+                    if not when or when < cutoff or when > wait_before:
+                        continue
+                    examined += 1
+                    answered = await _answered_by_me(message.get("id"), me, when)
+                    if answered is None:
+                        unknown += 1
+                        continue
+                    if answered:
+                        continue
+                    candidates.append(
+                        {
+                            "id": message.get("id"),
+                            "date": message.get("date"),
+                            "author": message.get("author"),
+                            "subject": message.get("subject"),
+                            "folder": folder.get("name"),
+                            "waited_days": (now - when).days,
+                        }
+                    )
+            candidates.sort(key=lambda row: row.get("date") or "", reverse=True)
+            result["inbound"] = {
+                "count": len(candidates),
+                "examined": examined,
+                "unknown_threads": unknown,
+                "messages": candidates,
+            }
+
+        result["note"] = (
+            "Threads are judged from Thunderbird's index; mail it has not indexed is not examined."
+        )
+        return result
+
+
+async def _answered_by_me(message_id: Any, me: str, sent_at: _dt.datetime) -> bool | None:
+    """Whether the thread holds a message from `me` after `sent_at`.
+
+    Returns None when the conversation could not be read, so the caller can report
+    unknown coverage rather than claiming a thread is unanswered.
+    """
+    try:
+        page = await _tolerant(
+            "search.conversation", [{"messageId": message_id, "limit": 100}], timeout=75.0
+        )
+    except Exception:  # noqa: BLE001 - unknown is a real answer here
+        return None
+    if not isinstance(page, dict):
+        return None
+    rows = _items(page)
+    if not rows:
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if me not in str(row.get("author") or "").lower():
+            continue
+        when = _parse_date(row.get("date"))
+        if when is not None and when > sent_at:
+            return True
+    return False
 
 
 def own_lower() -> str:
@@ -304,7 +456,7 @@ def own_lower() -> str:
 
 
 def _candidate_blocks(text: str) -> list[list[str]]:
-    """Trailing paragraphs that look like a signature."""
+    """Trailing paragraphs that look like a signature, not like a quoted digest."""
     lines = [line.rstrip() for line in text.splitlines()]
     blocks: list[list[str]] = []
     current: list[str] = []
@@ -318,10 +470,25 @@ def _candidate_blocks(text: str) -> list[list[str]]:
         blocks.append(current)
 
     picked: list[list[str]] = []
-    for block in blocks[-3:]:
-        if len(block) > 8:
+    for block in blocks[-4:]:
+        if not 2 <= len(block) <= 8:
             continue
         if any(_QUOTED.match(line) for line in block):
             continue
+        if any(_HEADERISH.match(line) for line in block):
+            continue
+        bullets = sum(1 for line in block if line.lstrip().startswith("- "))
+        if bullets > len(block) / 2:
+            continue
         picked.append(block)
     return picked
+
+
+def _signature_score(block: str, count: int, tokens: set[str], address: str) -> int:
+    """Favour what repeats and what carries the account's own name or address."""
+    score = count * 10
+    lowered = block.lower()
+    if address and address.lower() in lowered:
+        score += 6
+    score += 4 * sum(1 for token in tokens if token and token in block)
+    return score
