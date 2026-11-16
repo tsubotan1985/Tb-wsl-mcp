@@ -479,6 +479,40 @@ def cmd_detect_clients(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_call(args: argparse.Namespace) -> int:
+    """Call a single bridge method — the escape hatch when no MCP client is running."""
+    from .bridge import Bridge
+
+    try:
+        params = json.loads(args.params)
+    except json.JSONDecodeError as exc:
+        print(f"--params is not JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(params, dict):
+        print("--params must be a JSON object", file=sys.stderr)
+        return 2
+
+    settings = _settings_from_args(args)
+    bridge = Bridge(
+        profile_hint=settings.profile,
+        autostart=settings.autostart_daemon,
+        default_timeout=settings.default_timeout,
+    )
+
+    async def run() -> object:
+        return await bridge.call(args.method, params, timeout=args.timeout)
+
+    try:
+        result = asyncio.run(run())
+    except Exception as exc:  # noqa: BLE001 - the answer is the error, printed for a human
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(result, ensure_ascii=False, indent=2 if args.json else None, default=str)
+    )
+    return 0
+
+
 def cmd_tools(args: argparse.Namespace) -> int:
     """List the tools that would be registered — useful when writing allowlists."""
     from .server import build_server
@@ -623,6 +657,15 @@ def build_parser() -> argparse.ArgumentParser:
         "detect-clients", help="list installed MCP clients on this machine, as JSON"
     )
     detect.set_defaults(func=cmd_detect_clients)
+
+    callp = subparsers.add_parser(
+        "call", help="call one bridge method with JSON parameters (no MCP client needed)"
+    )
+    add_common(callp)
+    callp.add_argument("method", help="bridge method, for example messages.query")
+    callp.add_argument("--params", default="{}", help='JSON object, default "{}"')
+    callp.add_argument("--json", action="store_true", help="pretty-print the answer")
+    callp.set_defaults(func=cmd_call)
 
     tools = subparsers.add_parser("tools", help="list the tools that would be registered")
     add_common(tools)

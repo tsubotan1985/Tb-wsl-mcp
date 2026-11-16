@@ -20,6 +20,7 @@ ALL_TOOLSETS: tuple[str, ...] = (
     "mail",
     "folders",
     "compose",
+    "hermes",
     "search",
     "contacts",
     "calendar",
@@ -31,7 +32,7 @@ ALL_TOOLSETS: tuple[str, ...] = (
 
 #: What a fresh install gets. Lean on purpose: every extra tool costs context on
 #: every request, and the rest are one `--toolsets` away.
-DEFAULT_TOOLSETS: tuple[str, ...] = ("mail", "folders", "compose", "search", "admin")
+DEFAULT_TOOLSETS: tuple[str, ...] = ("mail", "folders", "compose", "hermes", "search", "admin")
 
 #: Preference branches an agent may touch without `--unsafe-prefs`. Anything that
 #: could exfiltrate mail, weaken transport security, or reach the credential store
