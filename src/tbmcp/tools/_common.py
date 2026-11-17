@@ -85,6 +85,10 @@ def coerce_date(value: str | None, *, field: str) -> str | None:
             f"{field} must be an ISO-8601 date or datetime (e.g. 2026-07-01 or "
             f"2026-07-01T09:30:00); got {value!r}."
         ) from exc
+    # Thunderbird's schema wants a *format: date* string, which means an explicit
+    # offset. A naive value is local time, so say so.
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
     return parsed.isoformat()
 
 
